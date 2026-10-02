@@ -619,28 +619,51 @@ class CarPlayHostActivity : ComponentActivity() {
             return
         }
         if (clusterPresentation != null) return
+        // PlayLife: a window parked by an earlier, destroyed activity is still on the cluster.
+        CarPlayBackgroundSession.takeParkedCluster()?.takeIf { it.isShowing }?.let { parked ->
+            parked.onSurface = { surface -> runOnUiThread { onClusterSurface(surface) } }
+            parked.setOnDismissListener {
+                if (clusterPresentation === parked) {
+                    clusterPresentation = null
+                    com.shilapi.xcertplay.hud.BydNavigationOutputs.setClusterMapShown(false)
+                }
+            }
+            clusterPresentation = parked
+            parked.outputSurface?.let(::onClusterSurface)
+            parked.setStreamActive(SCREEN_TYPE_ALT in activeScreenStreamTypes)
+            appendLog("Cluster map: adopted the window kept from the previous screen")
+            return
+        }
         val display = ClusterMapPresentation.findDisplay(this, theme) ?: run {
             appendLog("Cluster map: no cluster projection display among ${ClusterMapPresentation.describeDisplays(this)}")
             return
         }
-        val presentation = ClusterMapPresentation(this, display, theme) { surface -> runOnUiThread { onClusterSurface(surface) } }
-        // The system dismisses a presentation when its display goes away; allow a new one on resume.
-        presentation.setOnDismissListener {
-            if (clusterPresentation === presentation) {
-                clusterPresentation = null
-                com.shilapi.xcertplay.hud.BydNavigationOutputs.setClusterMapShown(false)
+        // PlayLife: the window is created with the application context first, so it does not belong
+        // to this activity and stays on the cluster when the main screen shows something else.
+        // If the system refuses that, fall back to the activity-bound window.
+        for (independent in listOf(true, false)) {
+            val presentation = ClusterMapPresentation(if (independent) applicationContext else this, display, theme) { surface ->
+                runOnUiThread { onClusterSurface(surface) }
             }
-        }
-        try {
-            presentation.show()
-            clusterPresentation = presentation
-            com.shilapi.xcertplay.hud.BydNavigationOutputs.setClusterMapShown(true)
-            presentation.setStreamActive(SCREEN_TYPE_ALT in activeScreenStreamTypes)
-            Log.i(ClusterMapPresentation.TAG, "cluster presentation shown display=${display.displayId} name=${display.name}")
-            appendLog("Cluster map: presentation shown display=${display.displayId}")
-        } catch (error: RuntimeException) {
-            Log.w(ClusterMapPresentation.TAG, "cluster presentation failed", error)
-            appendLog("Cluster map: presentation failed ${error.javaClass.simpleName}")
+            // The system dismisses a presentation when its display goes away; allow a new one on resume.
+            presentation.setOnDismissListener {
+                if (clusterPresentation === presentation) {
+                    clusterPresentation = null
+                    com.shilapi.xcertplay.hud.BydNavigationOutputs.setClusterMapShown(false)
+                }
+            }
+            try {
+                presentation.show()
+                clusterPresentation = presentation
+                com.shilapi.xcertplay.hud.BydNavigationOutputs.setClusterMapShown(true)
+                presentation.setStreamActive(SCREEN_TYPE_ALT in activeScreenStreamTypes)
+                Log.i(ClusterMapPresentation.TAG, "cluster presentation shown display=${display.displayId} name=${display.name} independent=$independent")
+                appendLog("Cluster map: presentation shown display=${display.displayId} independent=$independent")
+                return
+            } catch (error: RuntimeException) {
+                Log.w(ClusterMapPresentation.TAG, "cluster presentation failed independent=$independent", error)
+                appendLog("Cluster map: presentation failed independent=$independent ${error.javaClass.simpleName}")
+            }
         }
     }
 
@@ -679,6 +702,24 @@ class CarPlayHostActivity : ComponentActivity() {
         target.outputSurface?.let(::onClusterSurface)
         target.setStreamActive(SCREEN_TYPE_ALT in activeScreenStreamTypes)
         target.setMapVisible(visible)
+    }
+
+    /**
+     * PlayLife: when this screen is destroyed but the CarPlay session goes on (for example the home
+     * screen was opened), the cluster window must stay: nothing done on the main screen may change
+     * the cluster. It is handed to [CarPlayBackgroundSession] and adopted by the next screen, and
+     * closed when the session ends.
+     */
+    private fun parkClusterPresentation(): Boolean {
+        val presentation = clusterPresentation ?: return false
+        if (DiLink51ClusterLayout.supported() || shuttingDown.get()) return false
+        val session = CarPlayBackgroundSession.snapshot() ?: return false
+        presentation.onSurface = { surface -> if (surface != null) session.sink.setSurface(SCREEN_TYPE_ALT, surface) }
+        presentation.setOnDismissListener(null)
+        CarPlayBackgroundSession.parkCluster(presentation)
+        clusterPresentation = null
+        clusterSurface = null
+        return true
     }
 
     private fun dismissClusterPresentation() {
@@ -765,7 +806,7 @@ class CarPlayHostActivity : ComponentActivity() {
 
     override fun onDestroy() {
         clusterMonitor?.stop()
-        dismissClusterPresentation()
+        if (!parkClusterPresentation()) dismissClusterPresentation()
         mainHandler.removeCallbacks(applyDisplaySize)
         mainHandler.removeCallbacks(expireOldLogLines)
         currentSurface?.let { surface ->
@@ -3739,9 +3780,27 @@ internal object CarPlayBackgroundSession {
         this.height = height
     }
 
+    // PlayLife: the cluster window kept on the second screen while no CarPlay screen is open.
+    private var parkedCluster: ClusterMapPresentation? = null
+
+    @Synchronized
+    fun parkCluster(presentation: ClusterMapPresentation) {
+        parkedCluster?.takeIf { it !== presentation }?.let(::dismissLater)
+        parkedCluster = presentation
+    }
+
+    @Synchronized
+    fun takeParkedCluster(): ClusterMapPresentation? = parkedCluster.also { parkedCluster = null }
+
+    private fun dismissLater(presentation: ClusterMapPresentation) {
+        android.os.Handler(android.os.Looper.getMainLooper()).post { runCatching { presentation.dismiss() } }
+    }
+
     @Synchronized
     fun clear(expected: CarPlayController? = null, keepOwner: Boolean = false) {
         if (expected != null && controller !== expected) return
+        if (!keepOwner) parkedCluster?.let(::dismissLater)
+        if (!keepOwner) parkedCluster = null
         controller = null
         sink = null
         if (!keepOwner) { stopAction = null; owner = null }

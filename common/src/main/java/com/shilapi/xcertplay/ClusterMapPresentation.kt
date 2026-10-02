@@ -37,7 +37,8 @@ internal class ClusterMapPresentation(
     context: Context,
     display: Display,
     private val theme: DiLink51ClusterLayout.Theme = DiLink51ClusterLayout.theme(context),
-    private val onSurface: (Surface?) -> Unit,
+    // PlayLife: rebindable, because the window can outlive the activity that created it.
+    var onSurface: (Surface?) -> Unit,
 ) : Presentation(context, display) {
     private var waitingLabel: TextView? = null
     var outputSurface: Surface? = null
@@ -140,7 +141,9 @@ internal class ClusterMapPresentation(
                 ?.getDisplays(DisplayManager.DISPLAY_CATEGORY_PRESENTATION) ?: return null
             val name = DiLink51ClusterLayout.displayName(
                 displays.map { it.name }, android.os.Build.FINGERPRINT, theme,
-            ) ?: return null
+            ) ?: return com.carplaylife.cluster.ClusterMirror.findDisplay(context)
+                // PlayLife: any other car's second screen, when the user turned it on.
+                .takeIf { com.carplaylife.cluster.ClusterMirror.mode(context) != 0 }
             return displays.firstOrNull { it.name == name }?.takeIf {
                 if (!DiLink51ClusterLayout.supported()) true else {
                     val size = sizeOf(it)
